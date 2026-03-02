@@ -6,50 +6,51 @@
  * 使用 twikoo-func 实现核心逻辑，通过 Edge Function 操作 KV 数据库
  */
 
-import { v4 as uuidv4 } from 'uuid'
-import xss from 'xss'
 import bowser from 'bowser'
+import {
+  addQQMailSuffix,
+  checkGeeTestCaptcha,
+  checkTurnstileCaptcha,
+  equalsMail,
+  getAvatar,
+  getConfig,
+  getConfigForAdmin,
+  getFuncVersion,
+  getMailMd5,
+  getPasswordStatus,
+  getQQAvatar,
+  getUrlQuery,
+  getUrlsQuery,
+  isQQ,
+  normalizeMail,
+  preCheckSpam,
+  validate
+} from 'twikoo-func/utils'
+import constants from 'twikoo-func/utils/constants'
+import { uploadImage } from 'twikoo-func/utils/image'
+import {
+  commentImportArtalk,
+  commentImportArtalk2,
+  commentImportDisqus,
+  commentImportTwikoo,
+  commentImportValine,
+  jsonParse
+} from 'twikoo-func/utils/import'
 import {
   getMd5,
   getSha256,
   getXml2js,
   setCustomLibs
 } from 'twikoo-func/utils/lib'
-import { getIpRegion } from './ip2region-searcher.js'
-import {
-  getFuncVersion,
-  getUrlQuery,
-  getUrlsQuery,
-  normalizeMail,
-  equalsMail,
-  getMailMd5,
-  getAvatar,
-  isQQ,
-  addQQMailSuffix,
-  getQQAvatar,
-  getPasswordStatus,
-  preCheckSpam,
-  checkTurnstileCaptcha,
-  getConfig,
-  getConfigForAdmin,
-  validate
-} from 'twikoo-func/utils'
-import {
-  jsonParse,
-  commentImportValine,
-  commentImportDisqus,
-  commentImportArtalk,
-  commentImportArtalk2,
-  commentImportTwikoo
-} from 'twikoo-func/utils/import'
-import { postCheckSpam } from 'twikoo-func/utils/spam'
-import { sendNotice, emailTest } from 'twikoo-func/utils/notify'
-import { uploadImage } from 'twikoo-func/utils/image'
 import logger from 'twikoo-func/utils/logger'
-import constants from 'twikoo-func/utils/constants'
+import { emailTest, sendNotice } from 'twikoo-func/utils/notify'
+import { postCheckSpam } from 'twikoo-func/utils/spam'
+import { v4 as uuidv4 } from 'uuid'
+import xss from 'xss'
+import { getIpRegion } from './ip2region-searcher.js'
 
 const { RES_CODE, MAX_REQUEST_TIMES } = constants
-const VERSION = '1.7.0'
+const VERSION = '1.7.1'
 
 // 注入自定义依赖（对标 Cloudflare 版本）
 setCustomLibs({
@@ -817,11 +818,21 @@ async function limitFilter (db, ip) {
 }
 
 async function checkCaptcha (event, ip) {
-  if (config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
+  const provider = config.CAPTCHA_PROVIDER
+  if ((!provider || provider === 'Turnstile') && config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
     await checkTurnstileCaptcha({
       ip: ip,
       turnstileToken: event.turnstileToken,
       turnstileTokenSecretKey: config.TURNSTILE_SECRET_KEY
+    })
+  } else if (provider === 'Geetest' && config.GEETEST_CAPTCHA_ID && config.GEETEST_CAPTCHA_KEY) {
+    await checkGeeTestCaptcha({
+      geeTestCaptchaId: config.GEETEST_CAPTCHA_ID,
+      geeTestCaptchaKey: config.GEETEST_CAPTCHA_KEY,
+      geeTestLotNumber: event.geeTestLotNumber,
+      geeTestCaptchaOutput: event.geeTestCaptchaOutput,
+      geeTestPassToken: event.geeTestPassToken,
+      geeTestGenTime: event.geeTestGenTime
     })
   }
 }
