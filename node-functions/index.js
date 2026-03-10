@@ -6,6 +6,7 @@
  * 使用 twikoo-func 实现核心逻辑，通过 Edge Function 操作 KV 数据库
  */
 
+import nodemailerReal from 'nodemailer'
 import bowser from 'bowser'
 import {
   addQQMailSuffix,
@@ -52,7 +53,23 @@ import { getIpRegion } from './ip2region-searcher.js'
 const { RES_CODE, MAX_REQUEST_TIMES } = constants
 const VERSION = '1.7.1'
 
-// 注入自定义依赖（对标 Cloudflare 版本）
+// 判断是否为 HTTP API 类型的邮件服务（SendGrid / MailChannels）
+function isHttpMailService (service) {
+  if (!service) return false
+  const s = service.toLowerCase()
+  return s === 'sendgrid' || s === 'mailchannels'
+}
+
+// yeah.net SMTP 默认参数
+const YEAH_SMTP_DEFAULTS = {
+  host: 'smtp.yeah.net',
+  port: 465,
+  secure: true
+}
+
+// 注入自定义依赖
+// - HTTP API 类服务（SendGrid / MailChannels）仍使用 fetch 实现
+// - SMTP 类服务（yeah / yeah.net / 163 / 126 / QQ 等）使用真实 nodemailer
 setCustomLibs({
   DOMPurify: {
     sanitize (input) {
@@ -61,11 +78,56 @@ setCustomLibs({
   },
   nodemailer: {
     createTransport (mailConfig) {
+      const service = mailConfig.service || ''
+      const serviceLC = service.toLowerCase()
+
+      if (!isHttpMailService(service)) {
+        // 构造真实 nodemailer transport 配置
+        const transportConfig = { auth: {} }
+
+        // 优先使用 service 名称（nodemailer 内置支持 yeah/163/126/QQ/Gmail 等）
+        if (service) {
+          transportConfig.service = service
+        }
+
+        // yeah.net 补充默认 SMTP 参数（防止 nodemailer 服务列表未收录时仍可工作）
+        if (serviceLC === 'yeah' || serviceLC === 'yeah.net') {
+          if (!mailConfig.host) transportConfig.host = YEAH_SMTP_DEFAULTS.host
+          if (!mailConfig.port) transportConfig.port = YEAH_SMTP_DEFAULTS.port
+          if (mailConfig.secure === undefined) transportConfig.secure = YEAH_SMTP_DEFAULTS.secure
+        }
+
+        // 允许手动覆盖 host / port / secure
+        if (mailConfig.host) transportConfig.host = mailConfig.host
+        if (mailConfig.port) transportConfig.port = Number(mailConfig.port)
+        if (mailConfig.secure !== undefined) {
+          transportConfig.secure = mailConfig.secure === true || mailConfig.secure === 'true'
+        }
+
+        transportConfig.auth.user = mailConfig.auth && mailConfig.auth.user
+        transportConfig.auth.pass = mailConfig.auth && mailConfig.auth.pass
+
+        const smtpTransport = nodemailerReal.createTransport(transportConfig)
+
+        return {
+          verify () {
+            if (!transportConfig.auth.user) {
+              throw new Error('需要在 SMTP_USER 中配置发件邮箱账户。')
+            }
+            if (!transportConfig.auth.pass) {
+              throw new Error('需要在 SMTP_PASS 中配置邮箱授权码/密码。')
+            }
+            return smtpTransport.verify()
+          },
+          sendMail (mailOptions) {
+            return smtpTransport.sendMail(mailOptions)
+          }
+        }
+      }
+
+      // HTTP API 类服务：SendGrid / MailChannels
       return {
         verify () {
-          if (!mailConfig.service || (mailConfig.service.toLowerCase() !== 'sendgrid' && mailConfig.service.toLowerCase() !== 'mailchannels')) {
-            throw new Error('仅支持 SendGrid 和 MailChannels 邮件服务。')
-          }
           if (!mailConfig.auth || !mailConfig.auth.user) {
             throw new Error('需要在 SMTP_USER 中配置账户名，如果邮件服务不需要可随意填写。')
           }
@@ -75,7 +137,7 @@ setCustomLibs({
           return true
         },
         sendMail ({ from, to, subject, html }) {
-          if (mailConfig.service.toLowerCase() === 'sendgrid') {
+          if (serviceLC === 'sendgrid') {
             return fetch('https://api.sendgrid.com/v3/mail/send', {
               method: 'POST',
               headers: {
@@ -89,7 +151,7 @@ setCustomLibs({
                 content: [{ type: 'text/html', value: html }]
               })
             })
-          } else if (mailConfig.service.toLowerCase() === 'mailchannels') {
+          } else if (serviceLC === 'mailchannels') {
             return fetch('https://api.mailchannels.net/tx/v1/send', {
               method: 'POST',
               headers: {
