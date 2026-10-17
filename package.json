@@ -19,16 +19,24 @@
     "edge-computing"
   ],
   "scripts": {
-    "dev": "edgeone pages dev",
+    "dev": "edgeone makers dev",
     "build": "node build.cjs",
+    "test": "node --test",
     "postinstall": "node build.cjs"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@imaegoo/node-ip2region": "^2.1.1",
     "bowser": "^2.13.1",
+    "nodemailer": "10.1.2",
     "pako": "^2.1.0",
-    "twikoo-func": "^1.7.1",
+    "twikoo-func": "1.7.24",
     "uuid": "^8.3.2",
     "xss": "^1.0.15"
+  },
+  "overrides": {
+    "nodemailer": "$nodemailer"
   }
 }

@@ -7,12 +7,13 @@
  * KV 命名空间需要在 EdgeOne Pages 控制台绑定，变量名：TWIKOO_KV
  *
  * 存储结构：
- * - comments:all    - 所有评论的 JSON 数组（单次读取，减少 KV 调用）
- * - config:main     - 系统配置
- * - counter:{url}   - 页面访问计数
+ * - comments_all    - 所有评论的 JSON 数组（单次读取，减少 KV 调用）
+ * - config_main     - 系统配置
+ * - counter_{hash}  - 页面访问计数
  */
 
-const VERSION = '1.7.1'
+import { INTERNAL_TOKEN } from '../../.generated/internal-token.js'
+import { verifyKVRequest } from '../../lib/kv-auth.js'
 
 // 响应码
 const RES_CODE = {
@@ -22,47 +23,47 @@ const RES_CODE = {
 }
 
 // 评论存储的 KV 键名
-const COMMENTS_KEY = 'comments:all'
+const COMMENTS_KEY = 'comments_all'
 
 /**
  * EdgeOne Pages Edge Function 入口
  */
 export async function onRequest (context) {
-  const { request } = context
+  const { request, env = {} } = context
 
-  // 处理 CORS 预检请求
-  if (request.method === 'OPTIONS') {
-    return handleCors(request)
+  const headers = {
+    'Content-Type': 'application/json; charset=UTF-8',
+    'Cache-Control': 'no-store'
   }
-
-  // 只处理 POST 请求
+  const respond = (data, status = 200) => new Response(JSON.stringify(data), { status, headers })
   if (request.method !== 'POST') {
-    return new Response(JSON.stringify({
-      code: RES_CODE.SUCCESS,
-      message: 'Twikoo KV API 运行正常',
-      version: VERSION
-    }), {
-      headers: getCorsHeaders(request)
-    })
+    return respond({ code: RES_CODE.FORBIDDEN, message: '禁止直接访问 KV API' }, 405)
   }
 
-  let res = {}
+  const token = env.TWIKOO_INTERNAL_TOKEN ||
+    (typeof TWIKOO_INTERNAL_TOKEN !== 'undefined' ? TWIKOO_INTERNAL_TOKEN : INTERNAL_TOKEN)
+  if (!token) {
+    return respond({ code: RES_CODE.FAIL, message: '未配置 TWIKOO_INTERNAL_TOKEN' }, 503)
+  }
+  const rawBody = await request.text()
+  if (!await verifyKVRequest(token, request.url, rawBody, request.headers)) {
+    return respond({ code: RES_CODE.FORBIDDEN, message: '禁止直接访问 KV API' }, 403)
+  }
 
+  let body
   try {
-    // 验证内部调用
-    const isInternal = request.headers.get('X-Twikoo-Internal') === 'true'
-    if (!isInternal) {
-      return new Response(JSON.stringify({
-        code: RES_CODE.FORBIDDEN,
-        message: '禁止直接访问 KV API'
-      }), { headers: getCorsHeaders(request) })
+    body = JSON.parse(rawBody)
+    if (!body || typeof body.action !== 'string' || !body.data || typeof body.data !== 'object' || Array.isArray(body.data)) {
+      throw new Error('Invalid request')
     }
-
-    const body = await request.json()
-    const { action, data } = body
-
+  } catch {
+    return respond({ code: RES_CODE.FAIL, message: '请求体不合法' }, 400)
+  }
+  const { action, data } = body
+  let res = {}
+  try {
     // 创建数据库操作对象
-    const db = createKVDatabase()
+    const db = createKVDatabase(env.TWIKOO_KV || (typeof TWIKOO_KV !== 'undefined' ? TWIKOO_KV : undefined))
 
     switch (action) {
       case 'getComments':
@@ -103,29 +104,7 @@ export async function onRequest (context) {
     res = { code: RES_CODE.FAIL, message: `KV Error: ${e.message}` }
   }
 
-  return new Response(JSON.stringify(res), {
-    headers: getCorsHeaders(request)
-  })
-}
-
-// ==================== CORS 处理 ====================
-
-function handleCors (request) {
-  return new Response(null, {
-    status: 204,
-    headers: getCorsHeaders(request)
-  })
-}
-
-function getCorsHeaders (request) {
-  const origin = request.headers.get('origin') || '*'
-  return {
-    'Content-Type': 'application/json; charset=UTF-8',
-    'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Twikoo-Internal',
-    'Access-Control-Max-Age': '600'
-  }
+  return respond(res)
 }
 
 // ==================== 工具函数 ====================
@@ -152,9 +131,22 @@ function generateUUID () {
 
 // ==================== KV 数据库操作层（优化版） ====================
 
-function createKVDatabase () {
-  if (typeof TWIKOO_KV === 'undefined') {
+function createKVDatabase (kv) {
+  if (!kv) {
     throw new Error('未配置 TWIKOO_KV 命名空间，请在 EdgeOne Pages 控制台绑定 KV 存储')
+  }
+
+  // New keys use only letters, digits and underscores. Retain existing data
+  // from deployments where the legacy colon-separated keys were accepted.
+  async function readValue (key, legacyKey) {
+    const current = await kv.get(key)
+    if (current !== null && current !== undefined) return current
+    try {
+      return await kv.get(legacyKey)
+    } catch (error) {
+      if (/invalid.*key|key.*(?:invalid|character|format|allow|only)|键.*(?:格式|字符|不合法)/i.test(error.message)) return null
+      throw error
+    }
   }
 
   // 评论缓存（减少重复读取）
@@ -167,7 +159,7 @@ function createKVDatabase () {
         return commentsCache
       }
       // eslint-disable-next-line no-undef
-      const data = await TWIKOO_KV.get(COMMENTS_KEY)
+      const data = await readValue(COMMENTS_KEY, 'comments:all')
       commentsCache = data ? JSON.parse(data) : []
       return commentsCache
     },
@@ -176,7 +168,7 @@ function createKVDatabase () {
     async saveAllComments (comments) {
       commentsCache = comments
       // eslint-disable-next-line no-undef
-      await TWIKOO_KV.put(COMMENTS_KEY, JSON.stringify(comments))
+      await kv.put(COMMENTS_KEY, JSON.stringify(comments))
     },
 
     // 查询评论（支持过滤条件）
@@ -250,7 +242,7 @@ function createKVDatabase () {
     // 获取配置
     async getConfig () {
       // eslint-disable-next-line no-undef
-      const data = await TWIKOO_KV.get('config:main')
+      const data = await readValue('config_main', 'config:main')
       return data ? JSON.parse(data) : {}
     },
 
@@ -259,21 +251,21 @@ function createKVDatabase () {
       const currentConfig = await this.getConfig()
       const merged = { ...currentConfig, ...newConfig }
       // eslint-disable-next-line no-undef
-      await TWIKOO_KV.put('config:main', JSON.stringify(merged))
+      await kv.put('config_main', JSON.stringify(merged))
       return { updated: 1 }
     },
 
     // 获取计数器
     async getCounter (url) {
-      const key = `counter:${encodeURIComponent(url)}`
+      const key = await counterKey(url)
       // eslint-disable-next-line no-undef
-      const data = await TWIKOO_KV.get(key)
+      const data = await readValue(key, `counter:${encodeURIComponent(url)}`)
       return data ? JSON.parse(data) : null
     },
 
     // 增加计数器
     async incCounter (url, title) {
-      const key = `counter:${encodeURIComponent(url)}`
+      const key = await counterKey(url)
       let counter = await this.getCounter(url)
 
       if (counter) {
@@ -291,10 +283,15 @@ function createKVDatabase () {
       }
 
       // eslint-disable-next-line no-undef
-      await TWIKOO_KV.put(key, JSON.stringify(counter))
+      await kv.put(key, JSON.stringify(counter))
       return 1
     }
   }
+}
+
+async function counterKey (url) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(url))
+  return 'counter_' + Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 // ==================== 评论过滤函数 ====================
@@ -351,4 +348,4 @@ function matchCondition (comment, key, value) {
   return commentValue === value
 }
 
-export default { onRequest }
+export default onRequest

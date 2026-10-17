@@ -1,14 +1,28 @@
 /**
  * Twikoo EdgeOne Pages 构建脚本
  *
- * 处理不兼容包的覆写，类似 Cloudflare 版本的处理方式
+ * 生成 IP 数据并检查部署入口；不修改第三方依赖
  */
 
 const fs = require('fs')
 const path = require('path')
 const zlib = require('zlib')
+const { randomBytes } = require('node:crypto')
+const { execFileSync } = require('node:child_process')
 
 const srcDir = __dirname
+
+// Bundle the same private token into both server runtimes. It is never placed
+// in the static output or committed. An environment token can override it.
+const generatedDir = path.join(srcDir, '.generated')
+fs.mkdirSync(generatedDir, { recursive: true })
+const tokenFile = path.join(generatedDir, 'internal-token.js')
+if (!fs.existsSync(tokenFile)) {
+  fs.writeFileSync(tokenFile, `export const INTERNAL_TOKEN = '${randomBytes(32).toString('hex')}'\n`)
+}
+const outputDir = path.join(srcDir, 'dist')
+fs.mkdirSync(outputDir, { recursive: true })
+fs.copyFileSync(path.join(srcDir, 'favicon.ico'), path.join(outputDir, 'favicon.ico'))
 
 console.log('Twikoo EdgeOne Pages 构建脚本')
 console.log('==============================')
@@ -60,50 +74,23 @@ export default getIp2RegionBuffer
   fs.writeFileSync(ip2regionOutputPath, jsContent)
   console.log(`  ✓ 已生成: node-functions/ip2region-data.js (${(fs.statSync(ip2regionOutputPath).size / 1024 / 1024).toFixed(2)} MB)`)
 } else {
-  console.log('  ✗ ip2region.db 不存在，跳过生成')
-  console.log('    请先运行: npm install @imaegoo/node-ip2region')
+  console.error('ip2region.db 不存在，请先安装依赖')
+  process.exit(1)
 }
-console.log('')
-
-// 需要覆写的不兼容包（EdgeOne Node Function 不支持这些包）
-const packagesToOverwrite = [
-  // jsdom 依赖 canvas，Node Function 不支持
-  'node_modules/jsdom/lib/api.js',
-  // tencentcloud-sdk 体积大且不兼容
-  'node_modules/tencentcloud-sdk-nodejs/tencentcloud/index.js',
-  // nodemailer 在某些环境下有兼容性问题
-  'node_modules/nodemailer/lib/nodemailer.js'
-]
-
-console.log('步骤 1: 覆写不兼容的包...')
-let overwriteCount = 0
-for (const pkg of packagesToOverwrite) {
-  const filePath = path.join(srcDir, pkg)
-  if (fs.existsSync(filePath)) {
-    // 备份原文件（如果还没备份）
-    const backupPath = filePath + '.backup'
-    if (!fs.existsSync(backupPath)) {
-      fs.copyFileSync(filePath, backupPath)
-    }
-    // 覆写为空模块
-    fs.writeFileSync(filePath, '// Overwritten for EdgeOne Pages compatibility\nmodule.exports = {};\n')
-    console.log(`  ✓ 已覆写: ${pkg}`)
-    overwriteCount++
-  } else {
-    console.log(`  - 跳过（不存在）: ${pkg}`)
-  }
-}
-console.log(`  共覆写 ${overwriteCount} 个文件`)
 console.log('')
 
 // 检查必要文件
-console.log('步骤 2: 检查项目文件...')
+console.log('步骤 1: 检查项目文件...')
 const requiredFiles = [
+  'cloud-functions/index.js',
   'node-functions/index.js',
+  'lib/mail.js',
+  'lib/kv-auth.js',
   'node-functions/ip2region-searcher.js',
   'node-functions/ip2region-data.js',
   'edge-functions/api/kv.js',
-  'package.json'
+  'package.json',
+  'edgeone.json'
 ]
 
 let allFilesExist = true
@@ -119,10 +106,14 @@ for (const file of requiredFiles) {
 
 console.log('')
 if (allFilesExist) {
+  // File existence alone does not detect invalid ESM/CJS imports.
+  execFileSync(process.execPath, ['--input-type=module', '-e',
+    "await import('./cloud-functions/index.js'); await import('./edge-functions/api/kv.js')"
+  ], { cwd: srcDir, stdio: 'inherit' })
   console.log('构建完成！所有文件已就绪。')
   console.log('')
   console.log('项目结构：')
-  console.log('  node-functions/index.js            - Node Function 主入口')
+  console.log('  cloud-functions/index.js           - Node Function 主入口')
   console.log('  node-functions/ip2region-searcher.js - IP 归属地查询器')
   console.log('  node-functions/ip2region-data.js   - IP 数据库（自动生成）')
   console.log('  edge-functions/api/kv.js           - Edge Function KV API')

@@ -55,7 +55,7 @@ function initDatabase () {
   dbBuffer = getIp2RegionBuffer()
   firstIndexPtr = getLong(dbBuffer, 0)
   lastIndexPtr = getLong(dbBuffer, 4)
-  totalBlocks = ((lastIndexPtr - firstIndexPtr) / INDEX_BLOCK_LENGTH) | 0 + 1
+  totalBlocks = Math.floor((lastIndexPtr - firstIndexPtr) / INDEX_BLOCK_LENGTH) + 1
 }
 
 /**
@@ -76,7 +76,7 @@ export function searchSync (ip) {
   }
 
   let l = 0
-  let h = totalBlocks
+  let h = totalBlocks - 1
   let sip = 0
   let m = 0
   let p = 0

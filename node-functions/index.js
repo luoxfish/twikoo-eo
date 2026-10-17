@@ -6,10 +6,20 @@
  * 使用 twikoo-func 实现核心逻辑，通过 Edge Function 操作 KV 数据库
  */
 
-import tls from 'tls'
-import net from 'net'
 import bowser from 'bowser'
-import {
+import utils from 'twikoo-func/utils/index.js'
+import constants from 'twikoo-func/utils/constants.js'
+import imageUtils from 'twikoo-func/utils/image.js'
+import importUtils from 'twikoo-func/utils/import.js'
+import libUtils from 'twikoo-func/utils/lib.js'
+import logger from 'twikoo-func/utils/logger.js'
+import notifyUtils from 'twikoo-func/utils/notify.js'
+import spamUtils from 'twikoo-func/utils/spam.js'
+import { createTransport } from '../lib/mail.js'
+import { INTERNAL_TOKEN } from '../.generated/internal-token.js'
+import { signKVRequest } from '../lib/kv-auth.js'
+
+const {
   addQQMailSuffix,
   checkGeeTestCaptcha,
   checkTurnstileCaptcha,
@@ -26,27 +36,26 @@ import {
   isQQ,
   normalizeMail,
   preCheckSpam,
-  validate
-} from 'twikoo-func/utils'
-import constants from 'twikoo-func/utils/constants'
-import { uploadImage } from 'twikoo-func/utils/image'
-import {
+  validate,
+  validateClientFields
+} = utils
+const { uploadImage } = imageUtils
+const {
   commentImportArtalk,
   commentImportArtalk2,
   commentImportDisqus,
   commentImportTwikoo,
   commentImportValine,
   jsonParse
-} from 'twikoo-func/utils/import'
-import {
+} = importUtils
+const {
   getMd5,
   getSha256,
   getXml2js,
   setCustomLibs
-} from 'twikoo-func/utils/lib'
-import logger from 'twikoo-func/utils/logger'
-import { emailTest, sendNotice } from 'twikoo-func/utils/notify'
-import { postCheckSpam } from 'twikoo-func/utils/spam'
+} = libUtils
+const { emailTest, sendNotice } = notifyUtils
+const { postCheckSpam } = spamUtils
 import { v4 as uuidv4 } from 'uuid'
 import xss from 'xss'
 import { getIpRegion } from './ip2region-searcher.js'
@@ -54,235 +63,8 @@ import { getIpRegion } from './ip2region-searcher.js'
 const { RES_CODE, MAX_REQUEST_TIMES } = constants
 const VERSION = '1.7.1'
 
-// SMTP 服务商预设（host / port / secure）
-const SMTP_PRESETS = {
-  yeah: { host: 'smtp.yeah.net', port: 465, secure: true },
-  'yeah.net': { host: 'smtp.yeah.net', port: 465, secure: true },
-  163: { host: 'smtp.163.com', port: 465, secure: true },
-  126: { host: 'smtp.126.com', port: 465, secure: true },
-  qq: { host: 'smtp.qq.com', port: 465, secure: true },
-  gmail: { host: 'smtp.gmail.com', port: 465, secure: true },
-  outlook: { host: 'smtp-mail.outlook.com', port: 587, secure: false },
-  hotmail: { host: 'smtp-mail.outlook.com', port: 587, secure: false }
-}
-
-/**
- * 极简 SMTP 客户端（使用 Node.js 内置 tls / net 模块）
- * 支持：SSL 直连（端口 465）和 STARTTLS（端口 587/25）
- */
-function createSmtpClient (smtpConfig) {
-  const { host, port, secure, user, pass } = smtpConfig
-
-  function b64 (str) {
-    return Buffer.from(str).toString('base64')
-  }
-
-  function mimeEncodeSubject (subject) {
-    return `=?UTF-8?B?${b64(subject)}?=`
-  }
-
-  function buildRawMail ({ from, to, subject, html }) {
-    const boundary = `_twikoo_${Date.now()}`
-    return [
-      `From: ${from}`,
-      `To: ${to}`,
-      `Subject: ${mimeEncodeSubject(subject)}`,
-      'MIME-Version: 1.0',
-      `Content-Type: multipart/alternative; boundary="${boundary}"`,
-      '',
-      `--${boundary}`,
-      'Content-Type: text/html; charset=UTF-8',
-      'Content-Transfer-Encoding: base64',
-      '',
-      b64(html),
-      '',
-      `--${boundary}--`
-    ].join('\r\n')
-  }
-
-  function smtpConversation (socket, mailOptions) {
-    return new Promise((resolve, reject) => {
-      let buf = ''
-      let step = 0
-      const fromAddr = mailOptions.from.match(/<(.+?)>/) ? mailOptions.from.match(/<(.+?)>/)[1] : mailOptions.from
-      const toAddr = mailOptions.to.match(/<(.+?)>/) ? mailOptions.to.match(/<(.+?)>/)[1] : mailOptions.to
-      const rawMail = buildRawMail(mailOptions)
-
-      const send = (cmd) => {
-        logger.log('[SMTP] >>>', cmd.substring(0, 80))
-        socket.write(cmd + '\r\n')
-      }
-
-      const onData = (data) => {
-        buf += data.toString()
-        const lines = buf.split('\r\n')
-        buf = lines.pop()
-        for (const line of lines) {
-          if (!line) continue
-          logger.log('[SMTP] <<<', line.substring(0, 80))
-          const code = parseInt(line.substring(0, 3))
-          // 多行响应，等待最后一行（格式：XXX 空格 文字）
-          if (line[3] === '-') continue
-
-          if (step === 0 && code === 220) {
-            send(`EHLO ${host}`)
-            step = 1
-          } else if (step === 1 && code === 250) {
-            send('AUTH LOGIN')
-            step = 2
-          } else if (step === 2 && code === 334) {
-            send(b64(user))
-            step = 3
-          } else if (step === 3 && code === 334) {
-            send(b64(pass))
-            step = 4
-          } else if (step === 4 && code === 235) {
-            send(`MAIL FROM:<${fromAddr}>`)
-            step = 5
-          } else if (step === 5 && code === 250) {
-            send(`RCPT TO:<${toAddr}>`)
-            step = 6
-          } else if (step === 6 && code === 250) {
-            send('DATA')
-            step = 7
-          } else if (step === 7 && code === 354) {
-            socket.write(rawMail + '\r\n.\r\n')
-            step = 8
-          } else if (step === 8 && code === 250) {
-            send('QUIT')
-            step = 9
-          } else if (step === 9 && code === 221) {
-            socket.destroy()
-            resolve({ messageId: `<${Date.now()}@${host}>` })
-          } else if (code >= 400) {
-            socket.destroy()
-            reject(new Error(`SMTP 错误 ${code}: ${line.substring(4)}`))
-          }
-        }
-      }
-
-      socket.on('data', onData)
-      socket.on('error', reject)
-      socket.on('close', () => {
-        if (step < 9) reject(new Error('SMTP 连接意外关闭'))
-      })
-    })
-  }
-
-  return {
-    verify () {
-      if (!user) throw new Error('需要在 SMTP_USER 中配置发件邮箱账户。')
-      if (!pass) throw new Error('需要在 SMTP_PASS 中配置邮箱授权码/密码。')
-      return Promise.resolve(true)
-    },
-    sendMail (mailOptions) {
-      return new Promise((resolve, reject) => {
-        if (secure) {
-          // 465 端口：直接 TLS 连接
-          const socket = tls.connect({ host, port, servername: host }, () => {
-            smtpConversation(socket, mailOptions).then(resolve).catch(reject)
-          })
-          socket.on('error', reject)
-        } else {
-          // 587 端口：先明文连接，再 STARTTLS（简化：直接用明文 AUTH）
-          const socket = net.connect({ host, port }, () => {
-            smtpConversation(socket, mailOptions).then(resolve).catch(reject)
-          })
-          socket.on('error', reject)
-        }
-      })
-    }
-  }
-}
-
-// 判断是否为 HTTP API 类型的邮件服务
-function isHttpMailService (service) {
-  if (!service) return false
-  const s = service.toLowerCase()
-  return s === 'sendgrid' || s === 'mailchannels'
-}
-
-// 注入自定义依赖
-// - HTTP API 类（SendGrid / MailChannels）：使用 fetch
-// - SMTP 类（yeah / 163 / 126 / QQ 等）：使用内置 tls/net 实现的 SMTP 客户端
-setCustomLibs({
-  DOMPurify: {
-    sanitize (input) {
-      return input
-    }
-  },
-  nodemailer: {
-    createTransport (mailConfig) {
-      const service = mailConfig.service || ''
-      const serviceLC = service.toLowerCase()
-
-      if (!isHttpMailService(service)) {
-        // 从预设或手动配置中取 SMTP 参数
-        const preset = SMTP_PRESETS[serviceLC] || {}
-        const smtpConfig = {
-          host: mailConfig.host || preset.host || '',
-          port: Number(mailConfig.port || preset.port || 465),
-          secure: mailConfig.secure !== undefined
-            ? (mailConfig.secure === true || mailConfig.secure === 'true')
-            : (preset.secure !== undefined ? preset.secure : true),
-          user: mailConfig.auth && mailConfig.auth.user,
-          pass: mailConfig.auth && mailConfig.auth.pass
-        }
-
-        if (!smtpConfig.host) {
-          throw new Error(`未知邮件服务 "${service}"，请手动配置 SMTP_HOST。`)
-        }
-
-        return createSmtpClient(smtpConfig)
-      }
-
-      // HTTP API 类：SendGrid / MailChannels
-      return {
-        verify () {
-          if (!mailConfig.auth || !mailConfig.auth.user) {
-            throw new Error('需要在 SMTP_USER 中配置账户名，如果邮件服务不需要可随意填写。')
-          }
-          if (!mailConfig.auth || !mailConfig.auth.pass) {
-            throw new Error('需要在 SMTP_PASS 中配置 API 令牌。')
-          }
-          return true
-        },
-        sendMail ({ from, to, subject, html }) {
-          if (serviceLC === 'sendgrid') {
-            return fetch('https://api.sendgrid.com/v3/mail/send', {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${mailConfig.auth.pass}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                personalizations: [{ to: [{ email: to }] }],
-                from: { email: from },
-                subject,
-                content: [{ type: 'text/html', value: html }]
-              })
-            })
-          } else if (serviceLC === 'mailchannels') {
-            return fetch('https://api.mailchannels.net/tx/v1/send', {
-              method: 'POST',
-              headers: {
-                'X-Api-Key': mailConfig.auth.pass,
-                Accept: 'application/json',
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                personalizations: [{ to: [{ email: to }] }],
-                from: { email: from },
-                subject,
-                content: [{ type: 'text/html', value: html }]
-              })
-            })
-          }
-        }
-      }
-    }
-  }
-})
+// Keep SMTP TLS/authentication and MIME handling in Nodemailer.
+setCustomLibs({ nodemailer: { createTransport } })
 
 const md5 = getMd5()
 const sha256 = getSha256()
@@ -349,6 +131,8 @@ function toCommentDto (comment, uid, replies = [], comments = [], cfg) {
     }
   }
   const showRegion = !!cfg.SHOW_REGION && cfg.SHOW_REGION !== 'false'
+  const ups = comment.ups || comment.like || []
+  const downs = comment.downs || []
   return {
     id: comment._id.toString(),
     nick: comment.nick,
@@ -360,8 +144,12 @@ function toCommentDto (comment, uid, replies = [], comments = [], cfg) {
     browser: displayBrowser,
     ipRegion: showRegion ? getIpRegion(comment.ip, false) : '',
     master: comment.master,
-    like: comment.like ? comment.like.length : 0,
-    liked: comment.like ? comment.like.findIndex((item) => item === uid) > -1 : false,
+    like: ups.length,
+    ups: ups.length,
+    downs: downs.length,
+    liked: ups.includes(uid),
+    disliked: downs.includes(uid),
+    isOwner: Boolean(uid && comment.uid === uid),
     replies: replies,
     rid: comment.rid,
     pid: comment.pid,
@@ -401,27 +189,31 @@ function parseCommentForAdmin (comments) {
 }
 
 // 全局变量
-let config = null
-const requestTimes = {}
+const requestTimes = Object.create(null)
 
 // ==================== 工具函数 ====================
 
-// eslint-disable-next-line no-unused-vars
-function getAllowedOrigin (req) {
+function getAllowedOrigin (req, config) {
   const origin = req.headers.origin
-  const localhostRegex = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d{1,5})?$/
-  if (localhostRegex.test(origin)) {
-    return origin
-  } else if (config && config.CORS_ALLOW_ORIGIN) {
-    const corsList = config.CORS_ALLOW_ORIGIN.split(',')
-    for (const cors of corsList) {
-      if (cors.replace(/\/$/, '') === origin) {
-        return origin
-      }
-    }
+  if (!origin) return ''
+  const allowList = config.CORS_ALLOW_ORIGIN
+  if (!allowList) return origin
+  if (typeof allowList !== 'string') return ''
+  let originHost
+  try {
+    const parsed = new URL(origin)
+    if (!['http:', 'https:'].includes(parsed.protocol)) return ''
+    originHost = parsed.host
+  } catch {
     return ''
   }
-  return origin
+  return allowList.split(',').some(value => {
+    const allowed = value.trim().replace(/\/$/, '')
+    if (allowed === '*') return true
+    if (allowed === origin) return true
+    // Preserve the documented domain-only format.
+    return !allowed.includes('://') && originHost === allowed
+  }) ? origin : ''
 }
 
 // 获取 IP（优先使用 EdgeOne 提供的 eo-connecting-ip）
@@ -445,29 +237,32 @@ function protect (ip) {
 // 定期清理请求计数
 setInterval(() => {
   Object.keys(requestTimes).forEach(key => delete requestTimes[key])
-}, 10 * 60 * 1000)
+}, 10 * 60 * 1000).unref()
 
 // ==================== KV 代理层 ====================
 
 function createKVProxy (req) {
-  // 使用 eo-pages-host（EdgeOne Pages 提供的原始域名）
-  const host = req.headers['eo-pages-host'] || req.headers['x-forwarded-host'] || req.headers.host || 'localhost'
-  const protocol = req.headers['x-forwarded-proto'] || 'https'
-  const baseUrl = `${protocol}://${host}`
+  const baseUrl = req.origin
+  const token = req.internalToken
+  if (!token) throw new Error('请配置环境变量 TWIKOO_INTERNAL_TOKEN（Node 和 Edge 函数须使用同一值）')
 
   async function callKV (action, data) {
     const kvUrl = `${baseUrl}/api/kv`
+    const body = JSON.stringify({ action, data })
 
     try {
       const response = await fetch(kvUrl, {
         method: 'POST',
+        redirect: 'error',
+        signal: AbortSignal.timeout(15000),
         headers: {
           'Content-Type': 'application/json',
-          'X-Twikoo-Internal': 'true'
+          ...await signKVRequest(token, kvUrl, body)
         },
-        body: JSON.stringify({ action, data })
+        body
       })
 
+      if (!response.ok) throw new Error(`KV API HTTP ${response.status}`)
       const text = await response.text()
 
       let result
@@ -529,33 +324,32 @@ function createKVProxy (req) {
 
 // ==================== 配置管理 ====================
 
-async function readConfig (req) {
-  try {
-    const db = createKVProxy(req)
-    config = await db.getConfig()
-  } catch (e) {
-    logger.error('读取配置失败:', e.message)
-    config = {}
+async function readConfig (db, env) {
+  // A failed read must never be mistaken for an uninitialized administrator.
+  const config = await db.getConfig()
+  return {
+    ...config,
+    ...(!config.CAPTCHA_PROVIDER && config.TURNSTILE_SITE_KEY ? { CAPTCHA_PROVIDER: 'Turnstile' } : {}),
+    ...(env.CORS_ALLOW_ORIGIN ? { CORS_ALLOW_ORIGIN: env.CORS_ALLOW_ORIGIN } : {})
   }
-  return config
 }
 
 async function writeConfig (db, newConfig) {
   if (!Object.keys(newConfig).length) return 0
   logger.info('写入配置')
   await db.saveConfig(newConfig)
-  config = null
   return 1
 }
 
-function isAdmin (accessToken) {
-  return config && config.ADMIN_PASS === md5(accessToken)
+function isAdmin (accessToken, config) {
+  return Boolean(accessToken && config.ADMIN_PASS && config.ADMIN_PASS === md5(accessToken))
 }
 
 // ==================== 密码管理 ====================
 
-async function setPassword (event, db, accessToken) {
-  const isAdminUser = isAdmin(accessToken)
+async function setPassword (event, db, accessToken, config) {
+  validate(event, ['password'])
+  const isAdminUser = isAdmin(accessToken, config)
   if (config.ADMIN_PASS && !isAdminUser) {
     return { code: RES_CODE.PASS_EXIST, message: '请先登录再修改密码' }
   }
@@ -564,7 +358,8 @@ async function setPassword (event, db, accessToken) {
   return { code: RES_CODE.SUCCESS }
 }
 
-async function login (password) {
+async function login (password, config) {
+  validate({ password }, ['password'])
   if (!config) {
     return { code: RES_CODE.CONFIG_NOT_EXIST, message: '数据库无配置' }
   }
@@ -574,17 +369,17 @@ async function login (password) {
   if (config.ADMIN_PASS !== md5(password)) {
     return { code: RES_CODE.PASS_NOT_MATCH, message: '密码错误' }
   }
-  return { code: RES_CODE.SUCCESS }
+  return { code: RES_CODE.SUCCESS, accessToken: password }
 }
 
 // ==================== 评论读取 ====================
 
-async function commentGet (event, db, accessToken) {
+async function commentGet (event, db, accessToken, config) {
   const res = {}
   try {
     validate(event, ['url'])
     const uid = accessToken
-    const isAdminUser = isAdmin(accessToken)
+    const isAdminUser = isAdmin(accessToken, config)
     const limit = parseInt(config.COMMENT_PAGE_SIZE) || 8
     const sort = event.sort || 'newest'
     let more = false
@@ -609,8 +404,8 @@ async function commentGet (event, db, accessToken) {
       mainComments.sort((a, b) => a.created - b.created)
     } else if (sort === 'popular') {
       mainComments.sort((a, b) => {
-        const aUps = a.ups ? a.ups.length : 0
-        const bUps = b.ups ? b.ups.length : 0
+        const aUps = (a.ups || a.like || []).length
+        const bUps = (b.ups || b.like || []).length
         if (bUps !== aUps) return bUps - aUps
         return b.created - a.created
       })
@@ -620,14 +415,16 @@ async function commentGet (event, db, accessToken) {
 
     // 处理置顶和分页
     let top = []
-    if (!config.TOP_DISABLED && !event.before) {
-      top = mainComments.filter(c => c.top === true)
+    if (config.TOP_DISABLED !== 'true' && config.TOP_DISABLED !== true) {
+      if (!event.before) top = mainComments.filter(c => c.top === true)
       mainComments = mainComments.filter(c => c.top !== true)
     }
 
     // 分页
     if (event.before) {
-      mainComments = mainComments.filter(c => c.created < event.before)
+      mainComments = mainComments.filter(c => sort === 'oldest'
+        ? c.created > event.before
+        : c.created < event.before)
     }
 
     if (mainComments.length > limit) {
@@ -657,9 +454,9 @@ async function commentGet (event, db, accessToken) {
 
 // ==================== 管理员评论操作 ====================
 
-async function commentGetForAdmin (event, db, accessToken) {
+async function commentGetForAdmin (event, db, accessToken, config) {
   const res = {}
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
     validate(event, ['per', 'page'])
 
@@ -700,9 +497,9 @@ async function commentGetForAdmin (event, db, accessToken) {
   return res
 }
 
-async function commentSetForAdmin (event, db, accessToken) {
+async function commentSetForAdmin (event, db, accessToken, config) {
   const res = {}
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
     validate(event, ['id', 'set'])
     await db.updateComment(event.id, {
@@ -718,9 +515,9 @@ async function commentSetForAdmin (event, db, accessToken) {
   return res
 }
 
-async function commentDeleteForAdmin (event, db, accessToken) {
+async function commentDeleteForAdmin (event, db, accessToken, config) {
   const res = {}
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
     validate(event, ['id'])
     await db.deleteComment(event.id)
@@ -733,13 +530,13 @@ async function commentDeleteForAdmin (event, db, accessToken) {
   return res
 }
 
-async function commentImportForAdmin (event, db, accessToken) {
+async function commentImportForAdmin (event, db, accessToken, config) {
   const res = {}
   let logText = ''
   const log = (message) => {
     logText += `${new Date().toLocaleString()} ${message}\n`
   }
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
     try {
       validate(event, ['source', 'file'])
@@ -774,6 +571,9 @@ async function commentImportForAdmin (event, db, accessToken) {
         default:
           throw new Error(`不支持 ${event.source} 的导入，请更新 Twikoo 云函数至最新版本`)
       }
+      // Twikoo exports already contain HTML; sanitize that format as well as
+      // the Markdown-based import formats before storing it.
+      comments = comments.map(comment => ({ ...comment, comment: xss(comment.comment || '') }))
       await db.bulkAddComments(comments)
       log('导入成功')
     } catch (e) {
@@ -789,9 +589,9 @@ async function commentImportForAdmin (event, db, accessToken) {
   return res
 }
 
-async function commentExportForAdmin (event, db, accessToken) {
+async function commentExportForAdmin (event, db, accessToken, config) {
   const res = {}
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
     const data = await db.getComments()
     res.code = RES_CODE.SUCCESS
@@ -830,7 +630,7 @@ async function commentLike (event, db, accessToken) {
   const comment = await db.getComment(event.id)
 
   if (comment) {
-    const ups = comment.ups || []
+    const ups = comment.ups || comment.like || []
     const downs = comment.downs || []
 
     let newUps = [...ups]
@@ -864,20 +664,20 @@ async function commentLike (event, db, accessToken) {
 
 // ==================== 评论提交 ====================
 
-async function commentSubmit (event, req, db, accessToken) {
+async function commentSubmit (event, req, db, accessToken, config) {
   const res = {}
   validate(event, ['url', 'ua', 'comment'])
 
   const ip = getIp(req)
 
   // 限流检查
-  await limitFilter(db, ip)
+  await limitFilter(db, ip, config)
 
   // 验证码检查
-  await checkCaptcha(event, ip)
+  await checkCaptcha(event, ip, config)
 
   // 解析评论数据
-  const data = await parseCommentData(event, req, accessToken, ip)
+  const data = await parseCommentData(event, req, accessToken, ip, config)
 
   // 保存评论
   const result = await db.addComment(data)
@@ -885,17 +685,15 @@ async function commentSubmit (event, req, db, accessToken) {
   data._id = result.id
   res.id = result.id
 
-  // 异步处理垃圾检测和通知
-  postSubmit(data, db).catch(e => {
-    logger.error('POST_SUBMIT 失败', e.message)
-  })
+  // Wait for post-processing before the serverless invocation can end.
+  await postSubmit(data, db, config)
 
   return res
 }
 
-async function parseCommentData (event, req, accessToken, ip) {
+async function parseCommentData (event, req, accessToken, ip, config) {
   const timestamp = Date.now()
-  const isAdminUser = isAdmin(accessToken)
+  const isAdminUser = isAdmin(accessToken, config)
   const isBloggerMail = equalsMail(config.BLOGGER_EMAIL, event.mail)
 
   if (isBloggerMail && !isAdminUser) {
@@ -919,7 +717,7 @@ async function parseCommentData (event, req, accessToken, ip) {
     comment: xss(event.comment),
     pid: event.pid ? event.pid : event.rid,
     rid: event.rid,
-    isSpam: isAdminUser ? false : preCheckSpam(event, config),
+    isSpam: isAdminUser ? false : preCheckSpam({ ...event, nick: event.nick || '匿名' }, config),
     created: timestamp,
     updated: timestamp
   }
@@ -938,7 +736,7 @@ async function parseCommentData (event, req, accessToken, ip) {
   return commentDo
 }
 
-async function postSubmit (comment, db) {
+async function postSubmit (comment, db, config) {
   try {
     logger.log('POST_SUBMIT')
 
@@ -964,16 +762,16 @@ async function postSubmit (comment, db) {
   }
 }
 
-async function limitFilter (db, ip) {
+async function limitFilter (db, ip, config) {
+  const comments = await db.getComments()
   let limitPerMinute = parseInt(config.LIMIT_PER_MINUTE)
   if (Number.isNaN(limitPerMinute)) limitPerMinute = 10
 
   if (limitPerMinute) {
-    const comments = await db.getComments()
     const recentComments = comments.filter(c =>
-      c.ip === ip && c.created > Date.now() - 600000
+      c.ip === ip && c.created > Date.now() - 60000
     )
-    if (recentComments.length > limitPerMinute) {
+    if (recentComments.length >= limitPerMinute) {
       throw new Error('发言频率过高')
     }
   }
@@ -982,15 +780,14 @@ async function limitFilter (db, ip) {
   if (Number.isNaN(limitPerMinuteAll)) limitPerMinuteAll = 10
 
   if (limitPerMinuteAll) {
-    const comments = await db.getComments()
-    const recentComments = comments.filter(c => c.created > Date.now() - 600000)
-    if (recentComments.length > limitPerMinuteAll) {
+    const recentComments = comments.filter(c => c.created > Date.now() - 60000)
+    if (recentComments.length >= limitPerMinuteAll) {
       throw new Error('评论太火爆啦 >_< 请稍后再试')
     }
   }
 }
 
-async function checkCaptcha (event, ip) {
+async function checkCaptcha (event, ip, config) {
   const provider = config.CAPTCHA_PROVIDER
   if ((!provider || provider === 'Turnstile') && config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
     await checkTurnstileCaptcha({
@@ -1012,9 +809,12 @@ async function checkCaptcha (event, ip) {
 
 // ==================== 配置操作 ====================
 
-async function setConfig (event, db, accessToken) {
-  const isAdminUser = isAdmin(accessToken)
+async function setConfig (event, db, accessToken, config) {
+  const isAdminUser = isAdmin(accessToken, config)
   if (isAdminUser) {
+    if (!event.config || typeof event.config !== 'object' || Array.isArray(event.config)) {
+      throw new Error('config 必须为对象')
+    }
     await writeConfig(db, event.config)
     return { code: RES_CODE.SUCCESS }
   } else {
@@ -1062,7 +862,7 @@ async function getCommentsCount (event, db) {
   return res
 }
 
-async function getRecentComments (event, db) {
+async function getRecentComments (event, db, config) {
   const res = {}
   try {
     let comments = await db.getComments()
@@ -1101,163 +901,124 @@ async function getRecentComments (event, db) {
 }
 
 // EdgeOne Pages Node Function 入口
-export async function onRequest (context) {
-  const { request } = context
+async function handleTwikooRequest ({ request, env = {}, clientIp }) {
+  const url = new URL(request.url)
+  const runtimeEnv = { ...process.env, ...env }
+  const req = {
+    headers: Object.fromEntries(request.headers),
+    ip: clientIp,
+    origin: url.origin,
+    internalToken: runtimeEnv.TWIKOO_INTERNAL_TOKEN || INTERNAL_TOKEN
+  }
+  const responseHeaders = {
+    'Content-Type': 'application/json; charset=UTF-8',
+    'Cache-Control': 'no-store',
+    Vary: 'Origin'
+  }
+  const respond = (data, status = 200) => new Response(
+    status === 204 || request.method === 'HEAD' ? null : JSON.stringify(data),
+    { status, headers: responseHeaders }
+  )
+  let config = { CORS_ALLOW_ORIGIN: runtimeEnv.CORS_ALLOW_ORIGIN }
 
-  // 将 EdgeOne 请求转换为 Express 可处理的格式
-  // eslint-disable-next-line no-async-promise-executor
-  return new Promise(async (resolve) => {
-    try {
-      const url = new URL(request.url)
-      const method = request.method
-
-      // 构造模拟的 req 对象
-      const headers = {}
-      request.headers.forEach((value, key) => {
-        headers[key.toLowerCase()] = value
-      })
-
-      let body = null
-      if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
-        try {
-          body = await request.json()
-        } catch (e) {
-          body = {}
-        }
-      }
-
-      const req = {
-        method,
-        url: url.pathname + url.search,
-        path: url.pathname,
-        headers,
-        body,
-        ip: headers['x-real-ip'] || headers['x-forwarded-for']?.split(',')[0]?.trim() || 'unknown',
-        protocol: url.protocol.replace(':', ''),
-        get: (name) => headers[name.toLowerCase()]
-      }
-
-      // 构造模拟的 res 对象
-      let statusCode = 200
-      const resHeaders = {}
-      let resBody = null
-
-      const res = {
-        status: (code) => { statusCode = code; return res },
-        setHeader: (name, value) => { resHeaders[name] = value },
-        set: (name, value) => { resHeaders[name] = value },
-        json: (data) => {
-          resHeaders['Content-Type'] = 'application/json'
-          resBody = JSON.stringify(data)
-          finish()
-        },
-        send: (data) => {
-          resBody = data
-          finish()
-        },
-        end: () => finish()
-      }
-
-      function finish () {
-        resolve(new Response(resBody, {
-          status: statusCode,
-          headers: resHeaders
-        }))
-      }
-
-      // 手动处理路由
-      console.log(`[${new Date().toISOString()}] ${method} ${url.pathname}`)
-
-      // CORS 处理
-      const origin = headers.origin
-      if (origin) {
-        res.setHeader('Access-Control-Allow-Credentials', 'true')
-        res.setHeader('Access-Control-Allow-Origin', origin)
-        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
-        res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version')
-        res.setHeader('Access-Control-Max-Age', '600')
-      }
-
-      if (method === 'OPTIONS') {
-        res.status(204).end()
-        return
-      }
-
-      if (method === 'GET') {
-        res.json({
-          code: RES_CODE.SUCCESS,
-          message: 'Twikoo 云函数运行正常，请参考 https://twikoo.js.org/frontend.html 完成前端的配置',
-          version: VERSION
-        })
-        return
-      }
-
-      if (method === 'POST') {
-        // 调用主处理逻辑
-        await handlePost(req, res)
-        return
-      }
-
-      res.status(404).json({ code: 404, message: 'Not Found' })
-    } catch (e) {
-      console.error('onRequest error:', e)
-      resolve(new Response(JSON.stringify({ code: 500, message: e.message }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json' }
-      }))
+  function setCors () {
+    const origin = getAllowedOrigin(req, config)
+    if (origin) {
+      responseHeaders['Access-Control-Allow-Origin'] = origin
+      responseHeaders['Access-Control-Allow-Methods'] = 'POST, GET, HEAD, OPTIONS'
+      responseHeaders['Access-Control-Allow-Headers'] = 'Content-Type'
+      responseHeaders['Access-Control-Max-Age'] = '600'
     }
-  })
+    return !req.headers.origin || Boolean(origin)
+  }
+
+  try {
+    if (runtimeEnv.TWIKOO_SERVER_URL) req.origin = new URL(runtimeEnv.TWIKOO_SERVER_URL).origin
+    else if (req.headers['eo-pages-host']) req.origin = new URL(`https://${req.headers['eo-pages-host']}`).origin
+    if (request.method === 'GET' || request.method === 'HEAD') {
+      if (!setCors()) return respond({ code: RES_CODE.FORBIDDEN, message: 'Origin not allowed' }, 403)
+      return respond({
+        code: RES_CODE.SUCCESS,
+        message: 'Twikoo 云函数运行正常，请参考 https://twikoo.js.org/frontend.html 完成前端的配置',
+        version: VERSION
+      })
+    }
+    if (request.method !== 'POST' && request.method !== 'OPTIONS') {
+      responseHeaders.Allow = 'GET, HEAD, POST, OPTIONS'
+      setCors()
+      return respond({ code: 405, message: 'Method Not Allowed' }, 405)
+    }
+    if (request.method === 'POST') {
+      try {
+        req.body = await request.json()
+        if (!req.body || Array.isArray(req.body) || typeof req.body !== 'object') throw new Error('invalid body')
+      } catch {
+        setCors()
+        return respond({ code: RES_CODE.FAIL, message: '请求体必须为 JSON 对象' }, 400)
+      }
+    }
+    const db = createKVProxy(req)
+    config = await readConfig(db, runtimeEnv)
+    if (!setCors()) return respond({ code: RES_CODE.FORBIDDEN, message: 'Origin not allowed' }, 403)
+    if (request.method === 'OPTIONS') return respond(null, 204)
+    return respond(await handlePost(req, db, config))
+  } catch (error) {
+    logger.error('请求处理失败:', error.message)
+    setCors()
+    return respond({ code: RES_CODE.FAIL, message: error.message }, 503)
+  }
 }
 
+export { handleTwikooRequest as onRequest }
+export default handleTwikooRequest
+
 // POST 请求处理主逻辑
-async function handlePost (req, res) {
+async function handlePost (req, db, config) {
   let accessToken
   const event = req.body || {}
   const ip = getIp(req)
 
   logger.log('请求 IP：', ip)
   logger.log('请求函数：', event.event)
-  logger.log('请求参数：', event)
 
   let result = {}
 
   try {
+    validateClientFields(event)
+    for (const field of ['event', 'password', 'nick', 'mail', 'link', 'ua', 'comment', 'href']) {
+      if (event[field] != null && typeof event[field] !== 'string') throw new Error(`${field} 必须为字符串`)
+    }
+
     // 防护
     protect(ip)
 
     // 生成或使用 accessToken
     accessToken = event.accessToken || uuidv4().replace(/-/g, '')
 
-    // 读取配置
-    await readConfig(req)
-
-    // 创建数据库操作对象
-    const db = createKVProxy(req)
-
     switch (event.event) {
       case 'GET_FUNC_VERSION':
-        result = getFuncVersion({ VERSION })
+        result = getFuncVersion(VERSION)
         break
       case 'COMMENT_GET':
-        result = await commentGet(event, db, accessToken)
+        result = await commentGet(event, db, accessToken, config)
         break
       case 'COMMENT_GET_FOR_ADMIN':
-        result = await commentGetForAdmin(event, db, accessToken)
+        result = await commentGetForAdmin(event, db, accessToken, config)
         break
       case 'COMMENT_SET_FOR_ADMIN':
-        result = await commentSetForAdmin(event, db, accessToken)
+        result = await commentSetForAdmin(event, db, accessToken, config)
         break
       case 'COMMENT_DELETE_FOR_ADMIN':
-        result = await commentDeleteForAdmin(event, db, accessToken)
+        result = await commentDeleteForAdmin(event, db, accessToken, config)
         break
       case 'COMMENT_IMPORT_FOR_ADMIN':
-        result = await commentImportForAdmin(event, db, accessToken)
+        result = await commentImportForAdmin(event, db, accessToken, config)
         break
       case 'COMMENT_LIKE':
         result = await commentLike(event, db, accessToken)
         break
       case 'COMMENT_SUBMIT':
-        result = await commentSubmit(event, req, db, accessToken)
+        result = await commentSubmit(event, req, db, accessToken, config)
         break
       case 'COUNTER_GET':
         result = await counterGet(event, db)
@@ -1266,34 +1027,34 @@ async function handlePost (req, res) {
         result = await getPasswordStatus(config, VERSION)
         break
       case 'SET_PASSWORD':
-        result = await setPassword(event, db, accessToken)
+        result = await setPassword(event, db, accessToken, config)
         break
       case 'GET_CONFIG':
-        result = await getConfig({ config, VERSION, isAdmin: isAdmin(accessToken) })
+        result = await getConfig({ config, VERSION, isAdmin: isAdmin(accessToken, config) })
         break
       case 'GET_CONFIG_FOR_ADMIN':
-        result = await getConfigForAdmin({ config, isAdmin: isAdmin(accessToken) })
+        result = await getConfigForAdmin({ config, isAdmin: isAdmin(accessToken, config) })
         break
       case 'SET_CONFIG':
-        result = await setConfig(event, db, accessToken)
+        result = await setConfig(event, db, accessToken, config)
         break
       case 'LOGIN':
-        result = await login(event.password)
+        result = await login(event.password, config)
         break
       case 'GET_COMMENTS_COUNT':
         result = await getCommentsCount(event, db)
         break
       case 'GET_RECENT_COMMENTS':
-        result = await getRecentComments(event, db)
+        result = await getRecentComments(event, db, config)
         break
       case 'EMAIL_TEST':
-        result = await emailTest(event, config, isAdmin(accessToken))
+        result = await emailTest(event, config, isAdmin(accessToken, config))
         break
       case 'UPLOAD_IMAGE':
         result = await uploadImage(event, config)
         break
       case 'COMMENT_EXPORT_FOR_ADMIN':
-        result = await commentExportForAdmin(event, db, accessToken)
+        result = await commentExportForAdmin(event, db, accessToken, config)
         break
       default:
         if (event.event) {
@@ -1306,7 +1067,7 @@ async function handlePost (req, res) {
         }
     }
 
-    if (!result.code && !event.accessToken) {
+    if (!result.code && !event.accessToken && !result.accessToken) {
       result.accessToken = accessToken
     }
   } catch (e) {
@@ -1315,6 +1076,5 @@ async function handlePost (req, res) {
     result.message = e.message
   }
 
-  logger.log('请求返回：', result)
-  res.json(result)
+  return result
 }
